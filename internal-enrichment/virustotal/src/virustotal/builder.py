@@ -1,21 +1,28 @@
 # -*- coding: utf-8 -*-
 """VirusTotal builder module."""
-import datetime
+import datetime as dt
+import time
+
 import json
 from typing import Optional
 
 import plyara
 import plyara.utils
 import stix2
+from vt import Object
 from pycti import (
     ExternalReference,
     Location,
     Note,
     OpenCTIConnectorHelper,
     StixCoreRelationship,
+    Report
 )
 
 from .indicator_config import IndicatorConfig
+from stix2.v21.sdo import Malware, MalwareAnalysis
+from attr import attributes
+
 
 
 class VirusTotalBuilder:
@@ -26,27 +33,38 @@ class VirusTotalBuilder:
         helper: OpenCTIConnectorHelper,
         author: stix2.Identity,
         observable: dict,
-        data: dict,
+        data: dict
     ) -> None:
         """Initialize Virustotal builder."""
         self.helper = helper
         self.author = author
         self.bundle = [self.author]
+        self.indicators=[]
+        self.bundle_objects=[]
         self.observable = observable
         self.attributes = data["attributes"]
+        self.relations=None
+        if "relationships" in data.keys():
+            self.relations=data["relationships"]
+        self.behaviours=None
+        if "behaviours" in data.keys():
+            self.behaviours=data["behaviours"]
+        
+        
         self.score = VirusTotalBuilder._compute_score(
             self.attributes["last_analysis_stats"]
         )
 
         # Update score of observable.
-        self.helper.api.stix_cyber_observable.update_field(
+        if(self.observable is not None):
+            self.helper.api.stix_cyber_observable.update_field(
             id=self.observable["id"],
             input={"key": "x_opencti_score", "value": str(self.score)},
         )
-
+        self.sigma_rules=self.load_sigma_rules()
         # Add the external reference.
         link = self._extract_link(data["links"]["self"])
-        if link is not None:
+        if (link is not None) and (self.observable is not None):
             self.helper.log_debug(f"[VirusTotal] adding external reference {link}")
             self.external_reference = self._create_external_reference(
                 link,
@@ -54,19 +72,112 @@ class VirusTotalBuilder:
             )
         else:
             self.external_reference = None
+            
+        self.malwares=self.load_malwares()
+        self.technics = self.load_attack_techniks()
+        
+    def load_malwares(self):
+        
+        malware_query="""query Malwares($malwares_number:Int){
+
+                        malwares(first: $malwares_number){
+                          edges{
+                            node{
+                              standard_id,
+                              name,
+                              aliases
+                            }
+                          }
+              }
+            }
+        """
+        args={"malwares_number": 2000}
+        response=self.helper.api.query(malware_query,args)
+        
+        malwares={}
+        for malware in response["data"]["malwares"]["edges"]:
+            id=malware["node"]["standard_id"]
+            
+            malwares[malware["node"]["name"].lower()]=id
+            if(malware["node"]["aliases"]is not None):
+                for alias in malware["node"]["aliases"]:
+                    malwares[alias.lower()]=id
+            
+        
+        return malwares
+
+    def load_attack_techniks(self):
+        
+        attacks_query="""query attacks{
+                                      attackPatterns(first:2000 orderBy: x_mitre_id){
+                                        edges{
+                                          node{
+                                            x_mitre_id
+                                            x_opencti_stix_ids
+                                            subAttackPatterns{edges{node{x_mitre_id
+                                                                        x_opencti_stix_ids
+                                                                        }}}
+                                          }
+                                          
+                                        }
+                                      }
+                                    }
+        """
+        
+        response=self.helper.api.query(attacks_query)
+        
+        attacks={}
+        for node in response["data"]["attackPatterns"]["edges"]:
+            self.process_node(node["node"], attacks)    
+        return attacks
+
+    def process_node(self,node,attacks):
+        if(len(node["x_opencti_stix_ids"]) > 0):
+            mitre_id=node["x_mitre_id"].lower()
+            attacks[mitre_id]=node["x_opencti_stix_ids"][0]
+        if "subAttackPatterns" in node and len(node["subAttackPatterns"]["edges"]) > 0:
+            for subnode in node["subAttackPatterns"]["edges"]:
+                 attacks[subnode["node"]["x_mitre_id"].lower()]=subnode["node"]["x_opencti_stix_ids"][0]
+
+
+    def set_observable(self,observable):
+        self.observable=observable
+        
+    def collect_bundle_content(self,other_bundle:list):
+        for item in other_bundle:
+            self.bundle.append(item)
+    
+    def get_bundle(self):
+        return self.bundle
+    
+    def load_sigma_rules(self):
+        
+        sigma_query="""
+        query sigmarules{
+          indicators(first: 3000,orderBy: valid_from,filters:{key:pattern_type,values:["SIGMA"]}){
+            edges{node{standard_id,name}}
+          }
+        }
+        """
+        
+        response=self.helper.api.query(sigma_query)
+        
+        sigmarules={}
+        for node in response["data"]["indicators"]["edges"]:
+            stix_id=node["node"]["standard_id"]
+            sigma_name=node["node"]["name"] 
+            sigmarules[sigma_name]=stix_id
+        return sigmarules
 
     @staticmethod
     def _compute_score(stats: dict) -> int:
         """
         Compute the score for the observable.
-
         score = malicious_count / total_count * 100
-
         Parameters
         ----------
         stats : dict
             Dictionary with counts of each category (e.g. `harmless`, `malicious`, ...)
-
         Returns
         -------
         int
@@ -81,6 +192,8 @@ class VirusTotalBuilder:
         )
 
     def create_asn_belongs_to(self):
+        if("asn" not in self.attributes.keys()):
+            return;
         """Create AutonomousSystem and Relationship between the observable."""
         self.helper.log_debug(f'[VirusTotal] creating asn {self.attributes["asn"]}')
         as_stix = stix2.AutonomousSystem(
@@ -111,7 +224,6 @@ class VirusTotalBuilder:
         """
         Create an external reference with the given url.
         The external reference is added to the observable being enriched.
-
         Parameters
         ----------
         url : str
@@ -142,9 +254,7 @@ class VirusTotalBuilder:
     ):
         """
         Create an Indicator if the positives hits >= threshold specified in the config.
-
         Objects created are added in the bundle.
-
         Parameters
         ----------
         indicator_config : IndicatorConfig
@@ -152,7 +262,7 @@ class VirusTotalBuilder:
         pattern : str
             Stix pattern for the indicator.
         """
-        now_time = datetime.datetime.utcnow()
+        now_time = dt.datetime.utcnow()
 
         # Create an Indicator if positive hits >= ip_indicator_create_positives specified in config
         if (
@@ -163,7 +273,7 @@ class VirusTotalBuilder:
             self.helper.log_debug(
                 f"[VirusTotal] creating indicator with pattern {pattern}"
             )
-            valid_until = now_time + datetime.timedelta(
+            valid_until = now_time + dt.timedelta(
                 minutes=indicator_config.valid_minutes
             )
 
@@ -188,6 +298,8 @@ class VirusTotalBuilder:
                     "x_opencti_score": self.score,
                 },
             )
+            
+            
             relationship = stix2.Relationship(
                 id=StixCoreRelationship.generate_id(
                     "based-on",
@@ -202,11 +314,122 @@ class VirusTotalBuilder:
                 allow_custom=True,
             )
             self.bundle += [indicator, relationship]
+            self.indicators+=[indicator.id]
 
-    def create_ip_resolves_to(self, ipv4: str):
+    def get_opencti_file(self, sha256):
+        """
+        Determine whether or not an Artifact already exists in OpenCTI.
+
+        sha256: a str representing the sha256 of the artifact's file contents
+        returns: a bool indicidating the aforementioned
+        """
+
+        response = self.helper.api.stix_cyber_observable.read(
+            filters=[{"key": "hashes_SHA256", "values": [sha256]}]
+        )
+
+        
+        return response
+    
+    
+    
+    
+
+    def link_malware_with_related_observable(self,malware_id,file_id,relation_description,a_relation_type):
+        relationship = stix2.Relationship(
+            id=StixCoreRelationship.generate_id(
+                a_relation_type,
+                malware_id,
+                file_id,
+            ),
+            relationship_type=a_relation_type,
+            description=relation_description,
+            created_by_ref=self.author,
+            source_ref=malware_id,
+            target_ref=file_id,
+            confidence=self.helper.connect_confidence_level,
+            allow_custom=True,
+        )
+        self.bundle += [relationship]
+
+    
+    def create_file(self):
+        """
+        Create the File and link it to the observable.
+        Parameters
+        ----------
+       
+        """
+        self.helper.log_debug(f"[VirusTotal] creating file")
+        md5=self.attributes["md5"]
+        sha1=self.attributes["sha1"]
+        sha256=self.attributes["sha256"]
+        size=self.attributes["size"]
+        name=None
+        x_opencti_additional_names=None
+        if len(self.attributes["names"]) > 0:
+            name=self.attributes["names"][0]
+        if len(self.attributes["names"]) > 1:
+            
+            del self.attributes["names"][0]
+            x_opencti_additional_names=self.attributes['names']
+        hashes={};
+        hashes['MD5']=md5;
+        hashes['SHA1']=sha1;
+        hashes['SHA256']=sha256;
+        file_stix = stix2.File(
+            name=name,
+            hashes=hashes,
+            custom_properties={
+                "created_by_ref": self.author.id,
+                "x_opencti_score": self.score,
+            },
+            )
+        self.bundle += [file_stix]
+        return file_stix
+
+    def create_url(self, url: str):
+        """
+        Create the URL and link it to the observable.
+        Parameters
+        ----------
+        ipv4 : str
+            IPv4-Address to link.
+        """
+        self.helper.log_debug(f"[VirusTotal] creating url {url}")
+        url_stix = stix2.URL(
+            value=url,
+            custom_properties={
+                "created_by_ref": self.author.id,
+                "x_opencti_score": self.score,
+            },
+            )
+        self.bundle += [url_stix]
+        return url_stix
+
+    def create_domain(self, domain: str):
+        """
+        Create the Domain name and link it to the observable.
+        Parameters
+        ----------
+        domain : str
+            Domain-Name to link.
+        """
+        self.helper.log_debug(f"[VirusTotal] creating domain {domain}")
+        domain_stix = stix2.DomainName(
+            value=domain,
+            custom_properties={
+                "created_by_ref": self.author.id,
+                "x_opencti_score": self.score,
+            },
+            )
+        self.bundle += [domain_stix]
+        return domain_stix
+    
+    
+    def create_ip(self, ipv4: str):
         """
         Create the IPv4-Address and link it to the observable.
-
         Parameters
         ----------
         ipv4 : str
@@ -219,7 +442,21 @@ class VirusTotalBuilder:
                 "created_by_ref": self.author.id,
                 "x_opencti_score": self.score,
             },
-        )
+            )
+        self.bundle += [ipv4_stix]
+        return ipv4_stix
+
+
+    def create_ip_resolves_to(self, ipv4: str):
+        """
+        Create the IPv4-Address and link it to the observable.
+        Parameters
+        ----------
+        ipv4 : str
+            IPv4-Address to link.
+        """
+        #self.helper.log_debug(f"[VirusTotal] creating ipv4-address {ipv4}")
+        ipv4_stix = self.create_ip(ipv4)
         relationship = stix2.Relationship(
             id=StixCoreRelationship.generate_id(
                 "resolves-to",
@@ -233,9 +470,11 @@ class VirusTotalBuilder:
             confidence=self.helper.connect_confidence_level,
             allow_custom=True,
         )
-        self.bundle += [ipv4_stix, relationship]
+        self.bundle += [relationship]
 
     def create_location_located_at(self):
+        if "country" not in self.attributes.keys():
+            return
         """Create a Location and link it to the observable."""
         self.helper.log_debug(
             f'[VirusTotal] creating location with country {self.attributes["country"]}'
@@ -259,13 +498,43 @@ class VirusTotalBuilder:
             allow_custom=True,
         )
         self.bundle += [location_stix, relationship]
-
+    
+    def create_report(self):
+        report_name=" Virus Total graph at "+dt.datetime.utcfromtimestamp(int(time.time())).strftime("%Y-%m-%d")
+        report_published=dt.datetime.utcfromtimestamp(
+                    int(
+                        time.time()
+                    )
+                )
+        self.create_file()
+        objects_refs=self.bundle
+       # objects_refs.append(self.observable["standard_id"])
+        report = stix2.Report(
+                id=Report.generate_id(report_name, report_published),
+                name=report_name,
+                description=" Virus total observables graph at "+time.strftime("%Y-%m-%d"),
+                published=report_published,
+                created=dt.datetime.utcfromtimestamp(
+                    int(
+                        time.time()
+                    )
+                ).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                modified=dt.datetime.utcfromtimestamp(
+                    int(time.time())
+                ).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                report_types=["RECENT UPDATES"],
+                created_by_ref=self.author.id,
+#                object_marking_refs=event_markings,
+                labels=["osint","Virus Total"],
+                object_refs=objects_refs,
+                allow_custom=True,
+            )
+        self.bundle.append(report)
+    
     def create_note(self, abstract: str, content: str):
         """
         Create a single Note with the given abstract and content.
-
         The Note is inserted in the bundle.
-
         Parameters
         ----------
         abstract : str
@@ -273,21 +542,22 @@ class VirusTotalBuilder:
         content : str
             Content for the Note.
         """
-        self.helper.log_debug(f"[VirusTotal] creating note with abstract {abstract}")
-        self.bundle.append(
-            stix2.Note(
-                id=Note.generate_id(),
-                abstract=abstract,
-                content=content,
-                created_by_ref=self.author,
-                object_refs=[self.observable["standard_id"]],
+        if self.observable is not None:
+            self.helper.log_debug(f"[VirusTotal] creating note with abstract {abstract}")
+        
+            self.bundle.append(
+                stix2.Note(
+                    id=Note.generate_id(),
+                    abstract=abstract,
+                    content=content,
+                    created_by_ref=self.author,
+                    object_refs=[self.observable["standard_id"]],
+                )
             )
-        )
 
     def create_notes(self):
         """
         Create Notes with the analysis results and categories.
-
         Notes are directly append in the bundle.
         """
         if self.attributes["last_analysis_stats"]["malicious"] != 0:
@@ -311,7 +581,6 @@ class VirusTotalBuilder:
     ):
         """
         Create an indicator containing the YARA rule from VirusTotal and link it to the observable.
-
         Parameters
         ----------
         yara : dict
@@ -323,9 +592,10 @@ class VirusTotalBuilder:
         """
         self.helper.log_debug(f"[VirusTotal] creating indicator for yara {yara}")
         valid_from_date = (
-            datetime.datetime.min
+            
+            dt.datetime.utcnow()
             if valid_from is None
-            else datetime.datetime.utcfromtimestamp(valid_from)
+            else dt.utcfromtimestamp(valid_from)
         )
         ruleset_id = yara.get("id", "No ruleset id provided")
         self.helper.log_info(f"[VirusTotal] Retrieving ruleset {ruleset_id}")
@@ -363,7 +633,7 @@ class VirusTotalBuilder:
             },
         )
         self.helper.log_debug(f"[VirusTotal] yara indicator created: {indicator}")
-
+        self.indicators.append(indicator.id)
         # Create the relationships (`related-to`) between the yaras and the file.
         relationship = stix2.Relationship(
             id=StixCoreRelationship.generate_id(
@@ -384,14 +654,11 @@ class VirusTotalBuilder:
     def _extract_link(link: str) -> Optional[str]:
         """
         Extract the links for the external reference.
-
         For the gui link, observable type need to be singular.
-
         Parameters
         ----------
         link : str
             Original link used for the query
-
         Returns
         -------
             str, optional
@@ -410,14 +677,13 @@ class VirusTotalBuilder:
     def send_bundle(self) -> str:
         """
         Serialize and send the bundle to be inserted.
-
         Returns
         -------
         str
             String with the number of bundle sent.
         """
         if self.bundle is not None:
-            self.helper.log_debug(f"[VirusTotal] sending bundle: {self.bundle}")
+            self.helper.log_info(f"[VirusTotal] sending bundle: {self.bundle}")
             serialized_bundle = stix2.Bundle(
                 objects=self.bundle, allow_custom=True
             ).serialize()
@@ -453,7 +719,6 @@ class VirusTotalBuilder:
     def update_names(self, main: bool = False):
         """
         Update main and additional names.
-
         Parameters
         ----------
         main : bool
@@ -487,3 +752,80 @@ class VirusTotalBuilder:
             id=self.observable["id"],
             input={"key": "size", "value": str(self.attributes["size"])},
         )
+        
+    def create_malware(self):
+
+        malware_name=self.attributes["popular_threat_classification"]["suggested_threat_label"]
+        
+        malware_aliases=[malware_name.lower()]
+        
+        for name in self.attributes["popular_threat_classification"]["popular_threat_name"]:
+            malware_aliases+=[name["value"].lower()]
+        
+        self.helper.log_info(f"[VirusTotal] creating malware {malware_name}")
+
+        malware =Malware(is_family=False,
+                         name=malware_name,
+                         labels=["osint","Virus Total"])
+        self.bundle+=[malware]
+        
+        family_ref=None
+        for alias in malware_aliases:
+            if alias in self.malwares.keys():
+                family_ref = self.malwares[alias]
+                break;
+        
+        if family_ref is not None:
+            relationship = stix2.Relationship(
+            id=StixCoreRelationship.generate_id(
+                "variant-of",
+                malware.id,
+                family_ref,
+            ),
+            created_by_ref=self.author,
+            relationship_type="variant-of",
+            source_ref=malware.id,
+            target_ref=family_ref,
+            confidence=self.helper.connect_confidence_level,
+            allow_custom=True,
+            )
+            self.bundle+=[relationship]
+        
+        for indicator_id in self.indicators:
+            relationship = stix2.Relationship(
+            id=StixCoreRelationship.generate_id(
+                "indicates",
+                indicator_id,
+                malware.id,
+            ),
+            created_by_ref=self.author,
+            relationship_type="indicates",
+            source_ref=indicator_id,
+            target_ref=malware.id,
+            confidence=self.helper.connect_confidence_level,
+            allow_custom=True,
+            )
+            self.bundle+=[relationship]
+            
+            
+        self.create_notes()
+        return malware.id            
+     
+    def get_relations(self):
+        return self.relations
+                
+              #  for ip in contacted_ips:
+     #     self.process_contacted_ip(ip,malware-id)
+
+                      
+    def match_sigma_rules(self):
+       
+        if "sigma_analysis_results" in self.attributes:
+            sigma_analysis_results = self.attributes["sigma_analysis_results"]
+            for sigma_analysis in sigma_analysis_results:
+                rule_title = sigma_analysis["rule_title"]
+                if rule_title in self.sigma_rules.keys():
+                    rule_standard_id=self.sigma_rules[rule_title]
+                    #generate the relations between the rule (indicator) and the observable and malware
+                    self.indicators+=[rule_standard_id]
+

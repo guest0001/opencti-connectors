@@ -2,18 +2,46 @@
 """Virustotal client module."""
 import base64
 import json
-
+import vt
 import requests
 from pycti import OpenCTIConnectorHelper
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
+
+class VirusTotalGraphClient:
+    """VirusTotal client."""
+
+    def __init__(
+        self, helper: OpenCTIConnectorHelper, token: str
+    ) -> None:
+        """Initialize Virustotal client."""
+        self.helper = helper
+        # Drop the ending slash if present.
+        self.client=vt.Client(token)
+    
+    def get_file_info(self, hash):
+        """
+        Retrieve file information based on the given hash (any hash).
+
+        Parameters
+        ----------
+        hash256 : str
+            Hash of the file to retrieve.
+
+        Returns
+        -------
+        dict
+            File object, see https://developers.virustotal.com/reference/files.
+        """
+        
+        return self.client.get_object("/files/{}?relationships=behaviours,contacted_domains,contacted_ips,contacted_urls,dropped_files,itw_urls,itw_domains,itw_ips,carbonblack_children,carbonblack_parents,compressed_parents,embedded_domains,embedded_ips,embedded_urls,execution_parents,overlay_children,overlay_parents,pcap_children,pcap_parents,pe_resource_children,pe_resource_parents,similar_files,screenshots",hash)
 
 
 class VirusTotalClient:
     """VirusTotal client."""
 
     def __init__(
-        self, helper: OpenCTIConnectorHelper, base_url: str, token: str
+        self, helper: OpenCTIConnectorHelper, base_url: str, token: str,file_relations:str,ip_relations:str,url_relations:str,domain_relations:str
     ) -> None:
         """Initialize Virustotal client."""
         self.helper = helper
@@ -25,21 +53,21 @@ class VirusTotalClient:
             "accept": "application/json",
             "content-type": "application/json",
         }
-
+        self.file_relations=file_relations
+        self.ip_relations=ip_relations
+        self.url_relations=url_relations
+        self.domain_relations=domain_relations
+        
     def _query(self, url):
         """
         Execute a query to the Virustotal api.
-
         The authentication is done using the headers with the token given
         during the creation of the client.
-
         Retries are done if the query fails.
-
         Parameters
         ----------
         url : str
             Url to query.
-
         Returns
         -------
         JSON or None
@@ -76,10 +104,10 @@ class VirusTotalClient:
                 f"[VirusTotal] Error decoding the json: {err} - {response.text}"
             )
             return None
-
-    def get_file_info(self, hash256):
+        
+    def get_file_info(self, hash):
         """
-        Retrieve file information based on the given hash-256.
+        Retrieve file information based on the given hash (any hash).
 
         Parameters
         ----------
@@ -91,8 +119,13 @@ class VirusTotalClient:
         dict
             File object, see https://developers.virustotal.com/reference/files.
         """
-        url = f"{self.url}/files/{hash256}"
-        return self._query(url)
+        url = f"{self.url}/files/{hash}"
+        
+        if(self.file_relations is not None):
+            url+="?relationships="+self.file_relations
+        #behaviours,contacted_domains,contacted_ips,contacted_urls,dropped_files,itw_urls,itw_domains,itw_ips,carbonblack_children,carbonblack_parents,compressed_parents,embedded_domains,embedded_ips,embedded_urls,execution_parents,overlay_children,overlay_parents,pcap_children,pcap_parents,pe_resource_children,pe_resource_parents,similar_files,screenshots"
+        return self._query(url)        
+        
 
     def get_yara_ruleset(self, ruleset_id) -> dict:
         """

@@ -1,0 +1,10 @@
+eclipse.preferences.version=1
+encoding//external-import/alienvault/src/alienvault/utils/__init__.py=utf-8
+encoding//external-import/malpedia/src/malpedia.py=utf-8
+encoding//external-import/malpedia/src/malpedia/core.py=utf-8
+encoding//external-import/malpedia/src/malpedia/knowledge.py=utf-8
+encoding//external-import/malpedia/src/malpedia/models.py=utf-8
+encoding//internal-enrichment/virustotal/src/main.py=utf-8
+encoding//internal-enrichment/virustotal/src/virustotal/builder.py=utf-8
+encoding//internal-enrichment/virustotal/src/virustotal/client.py=utf-8
+encoding//internal-enrichment/virustotal/src/virustotal/virustotal.py=utf-8

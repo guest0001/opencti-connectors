@@ -8,7 +8,7 @@ import yaml
 from pycti import OpenCTIConnectorHelper, get_config_variable
 
 from .builder import VirusTotalBuilder
-from .client import VirusTotalClient
+from .client import VirusTotalClient, VirusTotalGraphClient
 from .indicator_config import IndicatorConfig
 
 
@@ -39,8 +39,31 @@ class VirusTotalConnector:
             confidence=self.helper.connect_confidence_level,
         )
 
-        self.client = VirusTotalClient(self.helper, self._API_URL, token)
+        file_relations = get_config_variable(
+            "VIRUSTOTAL_FILE_RELATIONS",
+            ["virustotal", "file_relations"],
+            config,
+        )
+        ip_relations = get_config_variable(
+            "VIRUSTOTAL_IP_RELATIONS",
+            ["virustotal", "ip_relations"],
+            config,
+        )
+        url_relations = get_config_variable(
+            "VIRUSTOTAL_URL_RELATIONS",
+            ["virustotal", "url_relations"],
+            config,
+        )
+        domain_relations = get_config_variable(
+            "VIRUSTOTAL_DOMAIN_RELATIONS",
+            ["virustotal", "domain_relations"],
+            config,
+        )
 
+        self.client = VirusTotalClient(self.helper, self._API_URL, token,file_relations,ip_relations,url_relations,domain_relations)
+        
+        
+        
         # Cache to store YARA rulesets.
         self.yara_cache = {}
 
@@ -52,7 +75,6 @@ class VirusTotalConnector:
             config,
             True,
         )
-
         # File/Artifact specific settings
         self.file_create_note_full_report = get_config_variable(
             "VIRUSTOTAL_FILE_CREATE_NOTE_FULL_REPORT",
@@ -95,18 +117,49 @@ class VirusTotalConnector:
             self.yara_cache[ruleset_id] = ruleset
         return ruleset
 
-    def _process_file(self, observable):
+    def _process_file_graph(self, observable):
+        
         json_data = self.client.get_file_info(observable["observable_value"])
+        
         assert json_data
         if "error" in json_data:
             raise ValueError(json_data["error"]["message"])
         if "data" not in json_data or "attributes" not in json_data["data"]:
             raise ValueError("An error has occurred.")
+        builder = VirusTotalBuilder(
+            self.helper, self.author, None, json_data["data"]
+        )
+        builder.set_observable(observable)
+        builder.create_indicator_based_on(
+            self.file_indicator_config,
+            f"""[file:hashes.'SHA-256' = '{json_data["data"]["attributes"]["sha256"]}']""",
+        )
 
+        self.process_file_graph(builder)
+        if self.file_create_note_full_report:
+            builder.create_note(
+                "VirusTotal Report", f"```\n{json.dumps(json_data, indent=2)}\n```"
+            )
+        builder.create_report()
+        return builder.send_bundle()
+
+    def _process_file(self, observable):
+        
+        json_data = self.client.get_file_info(observable["observable_value"])
+        
+        assert json_data
+        if "error" in json_data:
+            raise ValueError(json_data["error"]["message"])
+        if "data" not in json_data or "attributes" not in json_data["data"]:
+            raise ValueError("An error has occurred.")
+        
+      
+        
         builder = VirusTotalBuilder(
             self.helper, self.author, observable, json_data["data"]
         )
-
+        
+        
         builder.update_hashes()
 
         # Set the size and names (main and additional)
@@ -136,16 +189,197 @@ class VirusTotalConnector:
             builder.create_yara(
                 yara,
                 ruleset,
-                json_data["data"]["attributes"].get("creation_date", None),
+                json_data.get("creation_date", None),
             )
 
+ 
+        self.process_file_graph(builder)
+        
         # Create a Note with the full report
         if self.file_create_note_full_report:
             builder.create_note(
                 "VirusTotal Report", f"```\n{json.dumps(json_data, indent=2)}\n```"
             )
+        
+        builder.create_report()
+
         return builder.send_bundle()
 
+    def process_file_graph(self,builder):
+        builder.match_sigma_rules()
+        malware_id = builder.create_malware()
+        relations=builder.get_relations()
+        self.process_linked_ip_addresses(builder,relations,malware_id)
+        self.process_linked_urls(builder,relations,malware_id)
+        self.process_linked_domains(builder,relations,malware_id)
+        self.process_linked_files(builder,relations,malware_id)
+
+        #print(len(builder.get_bundle()))
+    def process_linked_files(self,parent_builder,data_relations,malware_id):
+        relations_map={"drops": ["dropped_files"],"part-of": ["carbonblack_parents","compressed_parents","execution_parents","overlay_parents","pe_resource_parents"],"related-to": ["carbonblack_children","overlay_children","pe_resource_children"]}
+        for (relationship,relation_names) in relations_map.items():
+            for relation_name in relation_names:
+                if relation_name in data_relations.keys():
+                    relation_datas = data_relations[relation_name]
+                    for file_data in relation_datas["data"]:
+                        file_id=self.process_linked_file(parent_builder, file_data["id"])
+                        if(file_id):
+                            parent_builder.link_malware_with_related_observable(malware_id,file_id,relation_name,relationship)
+                            
+                    
+                    
+    def process_linked_file(self,parent_builder, file_id):
+        json_data = self.client.get_file_info(file_id)
+        assert json_data
+        if "error" in json_data:
+            return None
+            #raise ValueError(json_data["error"]["message"])
+        if "data" not in json_data or "attributes" not in json_data["data"]:
+            raise ValueError("An error has occurred.")
+
+        builder = VirusTotalBuilder(
+            self.helper, self.author, None, json_data["data"]
+        )
+        
+        observable=builder.get_opencti_file(json_data["data"]["attributes"]["sha256"])
+        if(observable):
+            builder.set_observable(observable)
+            builder.update_hashes()
+            builder.update_size()
+            builder.update_names(
+                (observable["name"] is None or len(observable["name"]) == 0)
+            )
+
+            builder.create_indicator_based_on(
+                self.file_indicator_config,
+                f"""[file:hashes.'SHA-256' = '{json_data["data"]["attributes"]["sha256"]}']""",
+            )
+            # Create labels from tags
+            builder.update_labels()
+            file_id=observable["standard_id"]
+        else:
+            file_id = builder.create_file().id    
+        
+        parent_builder.collect_bundle_content(builder.get_bundle())
+        return file_id
+       
+    def process_linked_ip_addresses(self,parent_builder,data_relations,malware_id):
+        relations_map={"communicates-with": ["contacted_ips"],"embeds": ["embedded_ips"],"originates-from": ["itw_ips"]}
+        for (relationship,relation_names) in relations_map.items():
+            for relation_name in relation_names:
+                if relation_name in data_relations.keys():
+                    relation_datas = data_relations[relation_name]
+                    for ip_data in relation_datas["data"]:
+                        ip_id=self.process_linked_ip(parent_builder, ip_data["id"])
+                        if(ip_id):
+                            parent_builder.link_malware_with_related_observable(malware_id,ip_id,relation_name,relationship)
+
+    def process_linked_ip(self,parent_builder, ip_value):
+        json_data = self.client.get_ip_info(ip_value)
+        assert json_data
+        if "error" in json_data:
+            return None#raise ValueError(json_data["error"]["message"])
+        if "data" not in json_data or "attributes" not in json_data["data"]:
+            raise ValueError("An error has occurred.")
+
+        builder = VirusTotalBuilder(
+            self.helper, self.author, None, json_data["data"]
+        )
+        ip_address_id = builder.create_ip(ip_value).id
+        observable={"standard_id": ip_address_id,"observable_value": ip_value}
+        builder.set_observable(observable)
+        builder.create_asn_belongs_to()
+        builder.create_location_located_at()
+
+        builder.create_indicator_based_on(
+            self.ip_indicator_config,
+            f"""[ipv4-addr:value = '{observable["observable_value"]}']""",
+        )
+        builder.create_notes()
+        parent_builder.collect_bundle_content(builder.get_bundle())
+        return ip_address_id
+
+    def process_linked_domains(self,parent_builder,data_relations,malware_id):
+        relations_map={"communicates-with": ["contacted_domains"],"embeds": ["embedded_domains"],"originates-from": ["itw_domains"]}
+        for (relationship,relation_names) in relations_map.items():
+            for relation_name in relation_names:
+                if relation_name in data_relations.keys():
+                    relation_datas = data_relations[relation_name]
+                    for domain_data in relation_datas["data"]:
+                        domain_id=self.process_linked_domain(parent_builder, domain_data["id"])
+                        if(domain_id):
+                            parent_builder.link_malware_with_related_observable(malware_id,domain_id,relation_name,relationship)
+
+    def process_linked_domain(self,parent_builder, domain_value):
+        json_data = self.client.get_domain_info(domain_value)
+        assert json_data
+        if "error" in json_data:
+            return None#raise ValueError(json_data["error"]["message"])
+        if "data" not in json_data or "attributes" not in json_data["data"]:
+            raise ValueError("An error has occurred.")
+
+        builder = VirusTotalBuilder(
+            self.helper, self.author, None, json_data["data"]
+        )
+        domain_id = builder.create_domain(domain_value).id
+        observable={"standard_id": domain_id,"observable_value": domain_value}
+        builder.set_observable(observable)
+       
+        # Create IPv4 address observables for each A record
+        # and a Relationship between them and the observable.
+        for ip in [
+            r["value"]
+            for r in json_data["data"]["attributes"]["last_dns_records"]
+            if r["type"] == "A"
+        ]:
+            self.helper.log_debug(
+                f'[VirusTotal] adding ip {ip} to domain {observable["observable_value"]}'
+            )
+            builder.create_ip_resolves_to(ip)
+
+        builder.create_indicator_based_on(
+            self.domain_indicator_config,
+            f"""[domain-name:value = '{observable["observable_value"]}']""",
+        )
+        builder.create_notes()
+        parent_builder.collect_bundle_content(builder.get_bundle())
+        return domain_id
+
+
+    def process_linked_urls(self,parent_builder,data_relations,malware_id):
+        relations_map={"communicates-with": ["contacted_urls"],"embeds": ["embedded_urls"],"originates-from": ["itw_urls"]}
+        for (relationship,relation_names) in relations_map.items():
+            for relation_name in relation_names:
+                if relation_name in data_relations.keys():
+                    relation_datas = data_relations[relation_name]
+                    for url_data in relation_datas["data"]:
+                        url_id=self.process_linked_url(parent_builder, url_data["id"])
+                        if(url_id):
+                            parent_builder.link_malware_with_related_observable(malware_id,url_id,relation_name,relationship)
+
+
+    def process_linked_url(self,parent_builder, url_value):
+        json_data = self.client.get_url_info(url_value)
+        assert json_data
+        if "error" in json_data:
+            return None#raise ValueError(json_data["error"]["message"])
+        if "data" not in json_data or "attributes" not in json_data["data"]:
+            raise ValueError("An error has occurred.")
+
+        builder = VirusTotalBuilder(
+            self.helper, self.author, None, json_data["data"]
+        )
+        url_id = builder.create_url(url_value).id
+        observable={"standard_id": url_id,"observable_value": url_value}
+        builder.set_observable(observable)
+       
+        builder.create_indicator_based_on(
+            self.ip_indicator_config,
+            f"""[url:value = '{observable["observable_value"]}']""",        )
+        builder.create_notes()
+        parent_builder.collect_bundle_content(builder.get_bundle())
+        return url_id
+         
     def _process_ip(self, observable):
         json_data = self.client.get_ip_info(observable["observable_value"])
         assert json_data
