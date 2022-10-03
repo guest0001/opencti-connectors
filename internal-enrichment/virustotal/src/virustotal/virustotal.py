@@ -117,7 +117,7 @@ class VirusTotalConnector:
             self.yara_cache[ruleset_id] = ruleset
         return ruleset
 
-    def _process_file_graph(self, observable):
+    def run_test(self, observable):
         
         json_data = self.client.get_file_info(observable["observable_value"])
         
@@ -206,15 +206,44 @@ class VirusTotalConnector:
         return builder.send_bundle()
 
     def process_file_graph(self,builder):
-        builder.match_sigma_rules()
+        #builder.match_sigma_rules()
         malware_id = builder.create_malware()
+        
+        self.process_behaviours(builder,malware_id)
+        
         relations=builder.get_relations()
-        self.process_linked_ip_addresses(builder,relations,malware_id)
-        self.process_linked_urls(builder,relations,malware_id)
-        self.process_linked_domains(builder,relations,malware_id)
-        self.process_linked_files(builder,relations,malware_id)
-
+        
+        #self.process_linked_ip_addresses(builder,relations,malware_id)
+        #self.process_linked_urls(builder,relations,malware_id)
+        #self.process_linked_domains(builder,relations,malware_id)
+        #self.process_linked_files(builder,relations,malware_id)
+    
+    def process_behaviours(self,builder,malware_id):
+        behaviours_url=builder.get_behaviours_url()
+        if(behaviours_url):
+            behaviours_data = self.client.get_file_behaviours(behaviours_url)
+            for behaviour in behaviours_data["data"]:
+                if len(behaviour["relationships"]["attack_techniques"]["data"])>0:
+                    for technique in behaviour["relationships"]["attack_techniques"]["data"]:
+                        builder.process_technique(technique,malware_id)
+                self.process_behaviour(behaviour["attributes"],builder,malware_id)
+            
         #print(len(builder.get_bundle()))
+    
+    def process_behaviour(self,behaviour_attributes,builder,malware_id):
+        if("mutexes_created" in behaviour_attributes):                                                    
+            mutexes_created=behaviour_attributes["mutexes_created"]
+            for mutex in mutexes_created:
+                builder.create_mutex(mutex,malware_id)
+        if("registry_keys_deleted" in behaviour_attributes):                                                            
+            registry_keys_deleted=behaviour_attributes["registry_keys_deleted"]
+            for key in registry_keys_deleted:
+                builder.create_window_registry_key(key,malware_id)
+        if("processes_injected" in behaviour_attributes):                                                                   
+            processes_created=behaviour_attributes["processes_injected"]
+            for process in processes_created:
+                builder.create_process(process,malware_id)
+
     def process_linked_files(self,parent_builder,data_relations,malware_id):
         relations_map={"drops": ["dropped_files"],"part-of": ["carbonblack_parents","compressed_parents","execution_parents","overlay_parents","pe_resource_parents"],"related-to": ["carbonblack_children","overlay_children","pe_resource_children"]}
         for (relationship,relation_names) in relations_map.items():
@@ -264,7 +293,7 @@ class VirusTotalConnector:
         return file_id
        
     def process_linked_ip_addresses(self,parent_builder,data_relations,malware_id):
-        relations_map={"communicates-with": ["contacted_ips"],"embeds": ["embedded_ips"],"originates-from": ["itw_ips"]}
+        relations_map={"communicates-with": ["contacted_ips"],"related-to": ["embedded_ips"],"originates-from": ["itw_ips"]}
         for (relationship,relation_names) in relations_map.items():
             for relation_name in relation_names:
                 if relation_name in data_relations.keys():
@@ -300,7 +329,7 @@ class VirusTotalConnector:
         return ip_address_id
 
     def process_linked_domains(self,parent_builder,data_relations,malware_id):
-        relations_map={"communicates-with": ["contacted_domains"],"embeds": ["embedded_domains"],"originates-from": ["itw_domains"]}
+        relations_map={"communicates-with": ["contacted_domains"],"related-to": ["embedded_domains"],"originates-from": ["itw_domains"]}
         for (relationship,relation_names) in relations_map.items():
             for relation_name in relation_names:
                 if relation_name in data_relations.keys():
@@ -309,6 +338,7 @@ class VirusTotalConnector:
                         domain_id=self.process_linked_domain(parent_builder, domain_data["id"])
                         if(domain_id):
                             parent_builder.link_malware_with_related_observable(malware_id,domain_id,relation_name,relationship)
+                          
 
     def process_linked_domain(self,parent_builder, domain_value):
         json_data = self.client.get_domain_info(domain_value)
@@ -347,7 +377,7 @@ class VirusTotalConnector:
 
 
     def process_linked_urls(self,parent_builder,data_relations,malware_id):
-        relations_map={"communicates-with": ["contacted_urls"],"embeds": ["embedded_urls"],"originates-from": ["itw_urls"]}
+        relations_map={"communicates-with": ["contacted_urls"],"related-to": ["embedded_urls"],"originates-from": ["itw_urls"]}
         for (relationship,relation_names) in relations_map.items():
             for relation_name in relation_names:
                 if relation_name in data_relations.keys():

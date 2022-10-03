@@ -126,7 +126,11 @@ class VirusTotalClient:
         #behaviours,contacted_domains,contacted_ips,contacted_urls,dropped_files,itw_urls,itw_domains,itw_ips,carbonblack_children,carbonblack_parents,compressed_parents,embedded_domains,embedded_ips,embedded_urls,execution_parents,overlay_children,overlay_parents,pcap_children,pcap_parents,pe_resource_children,pe_resource_parents,similar_files,screenshots"
         return self._query(url)        
         
-
+    def get_file_behaviours(self,url):
+        url+="?relationships=attack_techniques"
+        
+        return self._query(url)
+        
     def get_yara_ruleset(self, ruleset_id) -> dict:
         """
         Retrieve the YARA rules based on the given ruleset id.

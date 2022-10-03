@@ -20,7 +20,8 @@ from pycti import (
 )
 
 from .indicator_config import IndicatorConfig
-from stix2.v21.sdo import Malware, MalwareAnalysis
+from stix2.v21.sdo import Malware, MalwareAnalysis, AttackPattern
+from stix2.v21.observables import Process,WindowsRegistryKey,Mutex
 from attr import attributes
 
 
@@ -46,9 +47,8 @@ class VirusTotalBuilder:
         self.relations=None
         if "relationships" in data.keys():
             self.relations=data["relationships"]
-        self.behaviours=None
-        if "behaviours" in data.keys():
-            self.behaviours=data["behaviours"]
+            if "behaviours" in self.relations.keys():
+                self.behaviours=self.relations["behaviours"]
         
         
         self.score = VirusTotalBuilder._compute_score(
@@ -74,7 +74,7 @@ class VirusTotalBuilder:
             self.external_reference = None
             
         self.malwares=self.load_malwares()
-        self.technics = self.load_attack_techniks()
+        self.load_attack_techniks()
         
     def load_malwares(self):
         
@@ -112,11 +112,10 @@ class VirusTotalBuilder:
                                       attackPatterns(first:2000 orderBy: x_mitre_id){
                                         edges{
                                           node{
+                                          x_opencti_stix_ids
                                             x_mitre_id
-                                            x_opencti_stix_ids
-                                            subAttackPatterns{edges{node{x_mitre_id
-                                                                        x_opencti_stix_ids
-                                                                        }}}
+                                            standard_id
+                                            name
                                           }
                                           
                                         }
@@ -126,11 +125,94 @@ class VirusTotalBuilder:
         
         response=self.helper.api.query(attacks_query)
         
-        attacks={}
-        for node in response["data"]["attackPatterns"]["edges"]:
-            self.process_node(node["node"], attacks)    
-        return attacks
+        self.mitre_attacks_names={}
+        self.mitre_attacks={}
+        for edge in response["data"]["attackPatterns"]["edges"]:
+            if(edge["node"]["x_mitre_id"]):
+                mitre_id=edge["node"]["x_mitre_id"].lower()
+                self.mitre_attacks[mitre_id.lower()]=edge["node"]["x_opencti_stix_ids"][0]
+                self.mitre_attacks_names[mitre_id.lower()]=edge["node"]["name"].lower()    
+        
 
+    def process_technique(self,technique,malware_id):
+        mitre_id=technique["id"]
+        for signature in technique["context_attributes"]["signatures"]:
+            severity = signature["severity"]
+            desc=signature["description"]
+            
+            self.create_technique_link(mitre_id, desc, malware_id)
+                            
+
+    def create_technique_link(self,mitre_id,tech_desc,malware_id):
+        
+        if mitre_id and self.mitre_attacks[mitre_id.lower()]:
+            
+            attack = AttackPattern(id=self.mitre_attacks[mitre_id.lower()],
+                                   name=self.mitre_attacks_names[mitre_id.lower()])
+            
+            relationship = stix2.Relationship(
+                relationship_type="uses",
+                created_by_ref=self.author,
+                source_ref=malware_id,
+                target_ref=self.mitre_attacks[mitre_id.lower()],
+                confidence=self.helper.connect_confidence_level,
+                description=tech_desc,
+                allow_custom=True,
+                )
+            self.bundle+=[attack,relationship]
+
+    def create_mutex(self,mutex,malware_id):
+        mutex = Mutex(name=mutex,
+                      created_by_ref=self.author.id,
+                    confidence=self.helper.connect_confidence_level,
+                    labels=["VirusTotal"])
+        self.bundle.append(mutex)
+        relationship = stix2.Relationship(
+            relationship_type="creates",
+            created_by_ref=self.author,
+            source_ref=malware_id,
+            target_ref=mutex.id,
+            confidence=self.helper.connect_confidence_level,
+            allow_custom=True,
+            )
+        self.bundle+=[relationship]
+    def create_window_registry_key(self,win_key,malware_id):
+        win_key = WindowsRegistryKey(key=win_key,
+                      created_by_ref=self.author.id,
+                    confidence=self.helper.connect_confidence_level,
+                    labels=["VirusTotal"])
+        self.bundle.append(win_key)
+        relationship = stix2.Relationship(
+            relationship_type="deletes",
+            created_by_ref=self.author,
+            source_ref=malware_id,
+            target_ref=win_key.id,
+            confidence=self.helper.connect_confidence_level,
+            allow_custom=True,
+            )
+        self.bundle+=[relationship]
+    def create_process(self,cwd_process,malware_id):
+        process = Process(cwd=cwd_process,
+                      created_by_ref=self.author.id,
+                    confidence=self.helper.connect_confidence_level,
+                    labels=["VirusTotal"])
+        self.bundle.append(process)
+        relationship = stix2.Relationship(
+            relationship_type="injects",
+            created_by_ref=self.author,
+            source_ref=malware_id,
+            target_ref=process.id,
+            confidence=self.helper.connect_confidence_level,
+            allow_custom=True,
+            )
+        self.bundle+=[relationship]
+
+    def get_behaviours_url(self):
+        behaviours_url=None
+        if self.behaviours:
+            behaviours_url=self.behaviours["links"]["related"]
+        return behaviours_url
+            
     def process_node(self,node,attacks):
         if(len(node["x_opencti_stix_ids"]) > 0):
             mitre_id=node["x_mitre_id"].lower()
